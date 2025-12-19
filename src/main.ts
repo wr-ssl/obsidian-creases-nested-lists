@@ -77,6 +77,16 @@ export default class CreasesPlugin extends Plugin {
       editorCallback: this.decreaseHeadingFoldLevel.bind(this),
     });
 
+    for (let level = 0; level <= 9; level++) {
+      this.addCommand({
+        id: `set-list-fold-level-${level}`,
+        name: `Set list fold level ${level}`,
+        editorCallback: (editor: Editor, view: MarkdownView) => {
+          this.setListFoldLevel(editor, view, level);
+        },
+      });
+    }
+
     this.app.workspace.onLayoutReady(() => {
       // this.patchCoreOutlinePlugin();
       this.registerEvent(this.app.vault.on("create", this.onNewFile.bind(this)));
@@ -268,6 +278,52 @@ export default class CreasesPlugin extends Plugin {
     view.onMarkdownFold();
   }
 
+  private setListFoldLevel(editor: Editor, view: MarkdownView, level: number) {
+    const existingFolds = view.currentMode.getFoldInfo()?.folds ?? [];
+    const indentUnit = this.getListIndentUnit(editor);
+
+    // Remove folds on list items at depths <= level so those depths are visible.
+    const foldsWithoutShallowLists = existingFolds.filter((fold) => {
+      const line = editor.getLine(fold.from);
+      if (!this.isMarkdownListItem(line)) {
+        return true;
+      }
+      const depth = this.getListDepth(line, indentUnit);
+      return depth > level;
+    });
+
+    // Add folds on list items exactly at `level` that contain deeper list items.
+    const foldableLines = this.getAllFoldableLines(editor);
+    const foldsToAdd = foldableLines.filter((fold) => {
+      const line = editor.getLine(fold.from);
+      if (!this.isMarkdownListItem(line)) {
+        return false;
+      }
+
+      const depth = this.getListDepth(line, indentUnit);
+      if (depth !== level) {
+        return false;
+      }
+
+      return this.foldRegionHasDeeperListItem(editor, fold, indentUnit, level);
+    });
+
+    const deduped: FoldPosition[] = [];
+    const seen = new Set<string>();
+    for (const fold of [...foldsWithoutShallowLists, ...foldsToAdd]) {
+      const key = `${fold.from}:${fold.to}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(fold);
+    }
+
+    view.currentMode.applyFoldInfo({
+      folds: deduped,
+      lines: view.editor.lineCount(),
+    });
+    view.onMarkdownFold();
+  }
+
   private patchMarkdownView() {
     const plugin = this as CreasesPlugin;
     const { workspace } = this.app;
@@ -424,6 +480,77 @@ export default class CreasesPlugin extends Plugin {
       pos = blockIdExp.index - 1;
     }
     return pos;
+  }
+
+  private isMarkdownListItem(line: string): boolean {
+    // Conservative list item detection: unordered (- + *) and ordered (1. / 1)).
+    // Intentionally ignores blockquotes/callouts to avoid unexpected folding.
+    return /^(\s*)(?:[-+*]|\d+[.)])\s+/.test(line);
+  }
+
+  private getListIndentUnit(editor: Editor): number {
+    let minPositiveIndent = Number.POSITIVE_INFINITY;
+    for (let lineNum = 0; lineNum <= editor.lastLine(); lineNum++) {
+      const line = editor.getLine(lineNum);
+      if (!this.isMarkdownListItem(line)) {
+        continue;
+      }
+      const indent = this.getIndentColumns(line);
+      if (indent > 0) {
+        minPositiveIndent = Math.min(minPositiveIndent, indent);
+      }
+    }
+
+    // Default to 2 if no indented list items exist.
+    return Number.isFinite(minPositiveIndent) ? minPositiveIndent : 2;
+  }
+
+  private getListDepth(line: string, indentUnit: number): number {
+    const indent = this.getIndentColumns(line);
+    if (indentUnit <= 0) {
+      return indent === 0 ? 0 : 1;
+    }
+    return Math.floor(indent / indentUnit);
+  }
+
+  private foldRegionHasDeeperListItem(
+    editor: Editor,
+    fold: FoldPosition,
+    indentUnit: number,
+    level: number
+  ): boolean {
+    const last = editor.lastLine();
+    const start = Math.min(last, fold.from + 1);
+    const end = Math.min(last, fold.to);
+    for (let lineNum = start; lineNum <= end; lineNum++) {
+      const line = editor.getLine(lineNum);
+      if (!this.isMarkdownListItem(line)) {
+        continue;
+      }
+      const depth = this.getListDepth(line, indentUnit);
+      if (depth > level) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private getIndentColumns(line: string): number {
+    // Tabs are treated as 4 columns (simple, stable heuristic).
+    let columns = 0;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === " ") {
+        columns += 1;
+        continue;
+      }
+      if (ch === "\t") {
+        columns += 4;
+        continue;
+      }
+      break;
+    }
+    return columns;
   }
 
   private async getCreasesFromFile(file: TFile): Promise<FoldPosition[]> {
